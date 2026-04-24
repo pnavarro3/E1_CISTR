@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
-  "idf.portWin": "detect",
+  "idf.portWin": "COM8",
   "idf.toolsPathWin": "C:\\Users\\Pablo\\.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
@@ -15,5 +15,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\Pablo\\Desktop\\CISTR\\Entregable 1\\Entregable1\\build"
-  ]
+  ],
+  "idf.flashType": "UART"
 }
