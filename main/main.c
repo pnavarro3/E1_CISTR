@@ -2,7 +2,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -24,8 +23,8 @@ static int id_estacion[3] = { 0, 1, 2 };
 static volatile TickType_t ultimo_evento_boton[3] = { 0 };
 
 static QueueHandle_t cola_estacion[3];
-static SemaphoreHandle_t mutex_procesamiento;
 static volatile int total_mezclas = 0;
+static portMUX_TYPE mux_mezclas = portMUX_INITIALIZER_UNLOCKED;
 
 static const char *nombre_estacion[] = { "Estacion Agua", "Estacion Arena", "Estacion Cemento" };
 
@@ -129,8 +128,10 @@ static void tarea_preparacion(void *pvParameters)
 		xQueueReceive(cola_materiales_disponibles, &material_aviso, portMAX_DELAY);
 
 		if (uxQueueSpacesAvailable(cola_packs_preparados) == 0) {
-			ESP_LOGW(TAG, "Preparacion llena: hay 3 packs en espera y no se recogen mas materiales");
-			continue;
+			ESP_LOGW(TAG, "Preparacion llena (3/3): no recoge mas materiales hasta que Procesamiento libere hueco");
+			while (uxQueueSpacesAvailable(cola_packs_preparados) == 0) {
+				vTaskDelay(pdMS_TO_TICKS(100));
+			}
 		}
 
 		for (int i = 0; i < NUM_MATERIALES && cantidad_disponible < 2; i++) {
@@ -174,18 +175,47 @@ static void tarea_estacion(void *pvParameters)
 {
 	int estacion = *(int *)pvParameters;
 	char codigo_pack;
+	int total_local;
 
 	while (true) {
 		xQueueReceive(cola_estacion[estacion], &codigo_pack, portMAX_DELAY);
 
-		xSemaphoreTake(mutex_procesamiento, portMAX_DELAY);
-
 		ESP_LOGI(TAG, "%s inicia mezcla con pack %c", nombre_estacion[estacion], codigo_pack);
 		vTaskDelay(pdMS_TO_TICKS(10000));
-		total_mezclas++;
-		ESP_LOGI(TAG, "%s finaliza mezcla. Total mezclas completadas: %d", nombre_estacion[estacion], total_mezclas);
 
-		xSemaphoreGive(mutex_procesamiento);
+		portENTER_CRITICAL(&mux_mezclas);
+		total_mezclas++;
+		total_local = total_mezclas;
+		portEXIT_CRITICAL(&mux_mezclas);
+
+		ESP_LOGI(TAG, "%s finaliza mezcla. Total mezclas completadas: %d", nombre_estacion[estacion], total_local);
+	}
+}
+
+static void tarea_panel_estado(void *pvParameters)
+{
+	(void)pvParameters;
+
+	while (true) {
+		const char *estado_arena = uxQueueMessagesWaiting(cola_receptaculos[0]) > 0 ? "Yes" : "No";
+		const char *estado_agua = uxQueueMessagesWaiting(cola_receptaculos[1]) > 0 ? "Yes" : "No";
+		const char *estado_cemento = uxQueueMessagesWaiting(cola_receptaculos[2]) > 0 ? "Yes" : "No";
+		UBaseType_t packs_en_preparacion = uxQueueMessagesWaiting(cola_packs_preparados);
+		int total_local;
+
+		portENTER_CRITICAL(&mux_mezclas);
+		total_local = total_mezclas;
+		portEXIT_CRITICAL(&mux_mezclas);
+
+		ESP_LOGI(TAG,
+			"PANEL | Carga Arena:%s Agua:%s Cemento:%s | Packs en Preparacion:%u/3 | Mezclas completadas:%d",
+			estado_arena,
+			estado_agua,
+			estado_cemento,
+			(unsigned int)packs_en_preparacion,
+			total_local);
+
+		vTaskDelay(pdMS_TO_TICKS(2000));
 	}
 }
 
@@ -204,10 +234,9 @@ void app_main(void)
 		cola_estacion[i] = xQueueCreate(CAPACIDAD_PACKS, sizeof(char));
 	}
 
-	mutex_procesamiento = xSemaphoreCreateMutex();
-
 	xTaskCreate(tarea_preparacion, "preparacion", 4096, NULL, 1, NULL);
 	xTaskCreate(tarea_procesamiento, "procesamiento", 4096, NULL, 1, NULL);
+	xTaskCreate(tarea_panel_estado, "panel_estado", 4096, NULL, 1, NULL);
 
 	for (int i = 0; i < NUM_MATERIALES; i++) {
 		xTaskCreate(tarea_estacion, "estacion", 4096, &id_estacion[i], 1, NULL);
@@ -218,7 +247,7 @@ void app_main(void)
 	ESP_LOGI(TAG, "Sistema iniciado receptaculos de Arena, Agua y Cemento listos para cargar");
 	ESP_LOGI(TAG, "Botones: Arena=GPIO18, Agua=GPIO19, Cemento=GPIO21");
 	ESP_LOGI(TAG, "Preparacion activa: combina dos materiales y almacena hasta 3 packs");
-	ESP_LOGI(TAG, "Procesamiento activo: 3 estaciones, exclusion mutua basica, 10s por mezcla");
+	ESP_LOGI(TAG, "Procesamiento activo: 3 estaciones simultaneas e independientes, 10s por mezcla");
 
 	while (true) {
 		vTaskDelay(pdMS_TO_TICKS(1000));
