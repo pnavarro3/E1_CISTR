@@ -1,0 +1,208 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{calc}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\lstset{
+  language=C,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  tabsize=4,
+}
+
+\title{Informe del Entregable 1\\CISTR}
+\author{Basado en la implementacion del repositorio}
+\date{5 de mayo de 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% --------------------------------------------------------------------------
+\section{Introduccion y contexto del sistema}
+% --------------------------------------------------------------------------
+
+Este informe explica las decisiones de diseno tomadas durante el desarrollo del sistema de control para la planta de produccion de cemento. El firmware corre sobre un ESP32 con ESP-IDF y FreeRTOS, todo contenido en un unico archivo fuente (\texttt{main/main.c}). La idea es justificar tecnicamente las elecciones en cuanto a tareas, sincronizacion y primitivas de tiempo real, no solo describir lo que hace el codigo.
+
+El codigo fuente completo esta disponible en el siguiente repositorio:
+\begin{center}
+  \url{https://github.com/pnavarro3/E1_CISTR}
+\end{center}
+
+% --------------------------------------------------------------------------
+\section{Descomposicion en tareas: criterio de diseno}
+% --------------------------------------------------------------------------
+
+Cuando hay multiples flujos de trabajo concurrentes, la forma de no volverse loco es seguir un criterio claro de descomposicion. Aqui se eligio \textbf{una tarea por recurso activo o por etapa del pipeline}: cada tarea tiene un unico proposito, se bloquea cuando no tiene trabajo y no pisa a las demas.
+
+La Tabla~\ref{tab:tareas} recoge las 9 tareas creadas en \texttt{app\_main} y la razon de cada una.
+
+\begin{table}[h!]
+\caption{Tareas FreeRTOS y justificacion de su existencia.}\label{tab:tareas}
+\begin{tabularx}{\linewidth}{%
+  >{\raggedright\arraybackslash\footnotesize}p{4.2cm}%
+  >{\centering\arraybackslash\footnotesize}p{1.8cm}%
+  >{\raggedright\arraybackslash\footnotesize}X}
+\toprule
+Tarea & Instancias & Justificacion de diseno \\
+\midrule
+\texttt{tarea\_carga\_material} & 3 & Una por material (Arena, Agua, Cemento). El mismo codigo parametrizado con \texttt{i} cubre los tres casos, cada uno gestionando su receptaculo de forma independiente. \\[4pt]
+\texttt{tarea\_preparacion} & 1 & Unico consumidor de la cola de materiales disponibles. Con un solo hilo no hay riesgo de que dos packs se generen a partir del mismo material. \\[4pt]
+\texttt{tarea\_procesamiento} & 1 & Unico lector de la cola de packs. Se encarga de enrutar cada pack a la estacion correcta; al ser el unico lector no necesita sincronizacion adicional. \\[4pt]
+\texttt{tarea\_estacion} & 3 & Una por estacion de mezcla, operando en paralelo. Cada una bloquea su propia cola sin coordinarse con las otras, lo que es exactamente la Opcion Avanzada I. \\[4pt]
+\texttt{tarea\_panel\_estado} & 1 & Imprime el estado del sistema cada 2 s. Tenerla separada evita que su logica de lectura interfiera con el resto del pipeline. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Eleccion de prioridades}
+
+Todas las tareas se crean con la misma prioridad (nivel 1). Funciona porque ninguna tiene un \textit{deadline} tan estricto que necesite expulsar a otra: los tiempos de ciclo del sistema (10 s de mezcla, 2 s de panel) son ordenes de magnitud mayores que el quantum del planificador. Si en el futuro se quisiera garantizar una latencia de respuesta baja en los botones, lo logico seria subir \texttt{tarea\_carga\_material} a una prioridad mayor.
+
+% --------------------------------------------------------------------------
+\section{Sincronizacion: uso exclusivo de colas}
+% --------------------------------------------------------------------------
+
+\subsection{Justificación del uso de colas}
+
+FreeRTOS ofrece semaforos binarios, mutexes, semaforos contadores y colas. La decision aqui fue \textbf{usar solo colas} para toda la comunicacion entre tareas e ISR. Hay dos razones concretas:
+
+\begin{enumerate}
+    \item \textbf{Las colas transportan datos y sincronizan a la vez.} Un semaforo avisa de que algo paso, pero no dice que. En este sistema la ISR necesita notificar una pulsacion y la tarea de carga necesita saber de que material se trata. Con una cola de capacidad 1 y elemento \texttt{uint8\_t} se resuelven las dos cosas con una sola primitiva.
+    \item \textbf{La capacidad de la cola es la restriccion del sistema.} Un receptaculo de capacidad 1 es directamente \texttt{xQueueCreate(1, sizeof(int))}. No hay que escribir logica adicional para ese limite: la cola lo impone sola.
+\end{enumerate}
+
+Un semaforo de espacio libre habria funcionado para controlar la capacidad, pero habria necesitado una segunda primitiva para pasar el ID del material a preparacion. Las colas evitan esa complejidad extra.
+
+\subsection{Inventario de colas y su semantica}
+
+\begin{table}[h!]
+\caption{Colas del sistema y su semantica de sincronizacion.}\label{tab:colas}
+\begin{tabularx}{\linewidth}{%
+  >{\raggedright\arraybackslash\footnotesize}p{5.2cm}%
+  >{\centering\arraybackslash\footnotesize}p{0.9cm}%
+  >{\raggedright\arraybackslash\footnotesize}X}
+\toprule
+Cola & Cap. & Semantica y justificacion \\
+\midrule
+\texttt{cola\_pulsaciones[i]} & 1 & ISR $\to$ \texttt{tarea\_carga\_material[i]}. Capacidad 1: si la tarea aun no proceso el evento anterior, la siguiente pulsacion se descarta (el antirrebote ya la filtra antes de llegar aqui). \\[4pt]
+\texttt{cola\_receptaculos[i]} & 1 & Representa el receptaculo fisico. Lleno cuando tiene un elemento, vacio cuando no. Un \texttt{xQueueSend(..., 0)} falla de inmediato si ya esta lleno, implementando la politica de descarte con aviso por log. \\[4pt]
+\texttt{cola\_materiales\_disponibles} & 3 & \texttt{tarea\_carga\_material} $\to$ \texttt{tarea\_preparacion}. Capacidad 3: como mucho un material de cada tipo puede estar esperando al mismo tiempo. Hace de buffer entre carga y preparacion. \\[4pt]
+\texttt{cola\_packs\_preparados} & 3 & \texttt{tarea\_preparacion} $\to$ \texttt{tarea\_procesamiento}. Capacidad 3. Al llenarse, preparacion entra en espera activa y lanza un \texttt{ESP\_LOGW}. \\[4pt]
+\texttt{cola\_estacion[i]} & 3 & \texttt{tarea\_procesamiento} $\to$ \texttt{tarea\_estacion[i]}. Capacidad 3 para absorber rafagas de packs hacia la misma estacion mientras esta ocupada procesando otro. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% --------------------------------------------------------------------------
+\section{Diseno de la ISR y antirrebote}
+% --------------------------------------------------------------------------
+La ISR implementada sigue exactamente ese patron:
+
+\begin{lstlisting}
+static void isr_boton(void *arg)
+{
+    int i = *(int *)arg;
+    BaseType_t tarea_prioritaria_despertada = pdFALSE;
+    TickType_t tick_actual = xTaskGetTickCountFromISR();
+    uint8_t evento = 1;
+
+    if (ultimo_evento_boton[i] != 0 &&
+        (tick_actual - ultimo_evento_boton[i]) < TIEMPO_ANTIRREBOTE) {
+        return;  // descarta rebote
+    }
+
+    ultimo_evento_boton[i] = tick_actual;
+    xQueueSendFromISR(cola_pulsaciones[i], &evento,
+                      &tarea_prioritaria_despertada);
+    if (tarea_prioritaria_despertada) {
+        portYIELD_FROM_ISR();
+    }
+}
+\end{lstlisting}
+
+Vale la pena revisar cada decision puntual:
+
+\begin{itemize}
+    \item \textbf{Antirrebote en la ISR, no en la tarea.} El filtro de 1000 ms se aplica comparando \textit{ticks} del sistema dentro de la propia ISR. Asi se cortan los eventos espurios antes de que lleguen a la cola y la tarea de carga no tiene que lidiar con ellos.
+    \item \textbf{\texttt{xQueueSendFromISR} en lugar de \texttt{xQueueSend}.} Las versiones \texttt{FromISR} son las unicas que pueden llamarse desde una interrupcion porque no bloquean el planificador. Usar la version normal desde una ISR corrompe el estado interno de FreeRTOS.
+    \item \textbf{\texttt{portYIELD\_FROM\_ISR}.} Si al insertar en la cola se desbloquea una tarea de mayor prioridad, se pide un cambio de contexto inmediato al salir. Con todas las tareas al mismo nivel no hay efecto practico aqui, pero es la forma correcta de escribirlo.
+    \item \textbf{Variable \texttt{volatile}.} El arreglo \texttt{ultimo\_evento\_boton[]} se declara \texttt{volatile} para que el compilador no optimice su acceso desde la ISR y desde las tareas.
+\end{itemize}
+
+% --------------------------------------------------------------------------
+\section{Seccion critica y proteccion del contador global}
+% --------------------------------------------------------------------------
+
+La variable \texttt{total\_mezclas} es compartida por tres tareas de estacion que corren en paralelo. Para protegerla se usa una \textbf{seccion critica de FreeRTOS} con \texttt{portMUX\_TYPE}:
+
+\begin{lstlisting}
+portENTER_CRITICAL(&mux_mezclas);
+total_mezclas++;
+total_local = total_mezclas;
+portEXIT_CRITICAL(&mux_mezclas);
+\end{lstlisting}
+
+Un mutex tiene sentido cuando la seccion critica puede tardar y conviene que el planificador ceda el procesador mientras se espera. Aqui la region es de una sola instruccion (incremento y lectura de un entero), asi que la espera activa de la seccion critica es mas rapida: sin latencia de planificacion y con tiempo de ejecucion constante.
+
+% --------------------------------------------------------------------------
+\section{Gestion de la saturacion en la unidad de preparacion}
+% --------------------------------------------------------------------------
+
+Cuando la cola de packs preparados llega a 3/3, \texttt{tarea\_preparacion} no puede enviar mas y tiene que esperar. El codigo lo resuelve con un \textbf{bucle de sondeo activo} de 100 ms:
+
+\begin{lstlisting}
+if (uxQueueSpacesAvailable(cola_packs_preparados) == 0) {
+    ESP_LOGW(TAG, "Preparacion llena (3/3)...");
+    while (uxQueueSpacesAvailable(cola_packs_preparados) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+\end{lstlisting}
+
+\begin{sloppypar}
+Lo ideal seria bloquearse en \texttt{xQueueSend(..., portMAX\_DELAY)} y ceder el procesador hasta que haya espacio. El problema es que \texttt{tarea\_preparacion} ya consumio un mensaje de \texttt{cola\_materiales\_}\allowbreak\texttt{disponibles} antes de llegar aqui, y no puede devolverlo. El sondeo con \texttt{vTaskDelay(100 ms)} es la salida practica: la latencia maxima de 100 ms es insignificante frente a los 10 s de ciclo de mezcla.
+\end{sloppypar}
+
+En el resto del sistema el bloqueo es siempre \texttt{portMAX\_DELAY}, con lo que las tareas no consumen CPU mientras no tienen trabajo:
+
+\begin{lstlisting}
+xQueueReceive(cola_pulsaciones[i], &evento, portMAX_DELAY);
+xQueueReceive(cola_packs_preparados,
+              &codigo_pack, portMAX_DELAY);
+xQueueReceive(cola_estacion[estacion],
+              &codigo_pack, portMAX_DELAY);
+\end{lstlisting}
+
+% --------------------------------------------------------------------------
+\section{Conclusion}
+% --------------------------------------------------------------------------
+
+El sistema esta construido sobre un conjunto de decisiones tecnicas coherentes entre si:
+
+\begin{itemize}
+    \item \textbf{Una tarea, una responsabilidad}: simplifica el razonamiento temporal y hace que los fallos sean mucho mas faciles de localizar.
+    \item \textbf{Solo colas para sincronizar}: la capacidad configurable modela directamente las restricciones del problema y el bloqueo en \texttt{portMAX\_DELAY} elimina la espera activa en casi todo el sistema.
+    \item \textbf{ISR minima}: filtra rebotes y encola un evento, nada mas. Toda la logica real ocurre en tareas.
+    \item \textbf{Seccion critica de espera activa para el contador}: la region es de una instruccion, por lo que la espera activa es mas rapida y sencilla que un mutex.
+    \item \textbf{Tres estaciones en paralelo}: elimina el cuello de botella de la exclusion mutua global y maximiza el rendimiento de la planta, cumpliendo la Opcion Avanzada I.
+\end{itemize}
+
+\end{document}
