@@ -197,9 +197,9 @@ static void tarea_panel_estado(void *pvParameters)
 	(void)pvParameters;
 
 	while (true) {
-		const char *estado_arena = uxQueueMessagesWaiting(cola_receptaculos[0]) > 0 ? "Yes" : "No";
-		const char *estado_agua = uxQueueMessagesWaiting(cola_receptaculos[1]) > 0 ? "Yes" : "No";
-		const char *estado_cemento = uxQueueMessagesWaiting(cola_receptaculos[2]) > 0 ? "Yes" : "No";
+		const char *estado_arena = uxQueueMessagesWaiting(cola_receptaculos[0]) > 0 ? "Si" : "No";
+		const char *estado_agua = uxQueueMessagesWaiting(cola_receptaculos[1]) > 0 ? "Si" : "No";
+		const char *estado_cemento = uxQueueMessagesWaiting(cola_receptaculos[2]) > 0 ? "Si" : "No";
 		UBaseType_t packs_en_preparacion = uxQueueMessagesWaiting(cola_packs_preparados);
 		int total_local;
 
